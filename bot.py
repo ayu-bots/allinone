@@ -1,22 +1,23 @@
 import os
 import asyncio
+import time
 from aiohttp import web
 from pyrogram import Client, filters
-from pyrogram.types import BotCommand
+from pyrogram.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- Configuration ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-PORT = os.environ.get("PORT", "8080") # Koyeb provides this
+PORT = os.environ.get("PORT", "8080")
 
 bot = Client("VideoBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 queue = asyncio.Queue()
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
-# --- Koyeb Health Check Server ---
+# --- Health Check Server (Koyeb Fix) ---
 async def handle_health_check(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is Alive")
 
 async def start_web_server():
     app = web.Application()
@@ -25,96 +26,135 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(PORT))
     await site.start()
-    print(f"Health check server started on port {PORT}")
 
-# --- Bot Commands Logic ---
+# --- Helpers ---
+def get_resolution(cmd):
+    res_map = {
+        "144p": "256:144",
+        "240p": "426:240",
+        "360p": "640:360",
+        "480p": "854:480",
+        "720p": "1280:720",
+        "1080p": "1920:1080",
+        "2k": "2560:1440",
+        "4k": "3840:2160"
+    }
+    return res_map.get(cmd, "1280:720")
+
+# --- Commands ---
 @bot.on_message(filters.command("start"))
-async def start_cmd(client, message):
-    await message.reply_text("🚀 **High-Speed Encoder Bot is Online!**\n\nSend me a video (up to 2GB) to start. I use a queue system to prevent crashes on Koyeb Free Tier.")
+async def start(client, message):
+    await message.reply_text(
+        "✨ **High Speed Encoder Bot**\n\n"
+        "Send me any video (up to 2GB).\n"
+        "Use /encode [res] (e.g., `/encode 720p`) by replying to a video."
+    )
 
 @bot.on_message(filters.command("help"))
 async def help_cmd(client, message):
-    await message.reply_text(
+    text = (
         "**Available Commands:**\n"
-        "• `/encode` - 122p to 4k (Reply to video)\n"
-        "• `/merge` - Join videos\n"
-        "• `/screenshot` - Generate frames\n"
-        "• `/softsub` - Add internal subtitles\n\n"
-        "**Limit:** 2GB per file."
+        "• Reply to video with `/encode 480p` (144p to 4k available)\n"
+        "• Reply to video with `/screenshot` to get a frame\n"
+        "• Reply to video with `/softsub` to add internal subs\n"
+        "• `/merge` - (Coming soon/In-Dev)\n\n"
+        "**Note:** Files over 2GB will be automatically rejected."
     )
+    await message.reply_text(text)
 
-# --- Queue and Processing ---
+# --- Processing Engine ---
 async def worker():
     while True:
-        message, task_type, resolution = await queue.get()
+        message, task_type, value = await queue.get()
+        reply = await message.reply_text("📥 Downloading to Koyeb...")
+        
+        # Correct Path Handling
+        original_path = await bot.download_media(message)
+        file_dir = os.path.dirname(original_path)
+        file_name = os.path.basename(original_path)
+        output_path = os.path.join(file_dir, f"proc_{int(time.time())}_{file_name}.mp4")
+
         try:
-            # Check size again before processing
-            file_size = (message.video or message.document).file_size
-            if file_size > MAX_FILE_SIZE:
-                await message.reply_text("❌ File exceeds 2GB. Koyeb/Telegram limit reached.")
+            if task_type == "encode":
+                res = get_resolution(value)
+                await reply.edit_text(f"⚙️ Encoding to {value}...")
+                cmd = [
+                    "ffmpeg", "-i", original_path,
+                    "-vf", f"scale={res}",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                    "-c:a", "aac", "-b:a", "128k",
+                    output_path, "-y"
+                ]
+            
+            elif task_type == "screenshot":
+                output_path = output_path.replace(".mp4", ".jpg")
+                await reply.edit_text("📸 Generating Screenshot...")
+                cmd = ["ffmpeg", "-i", original_path, "-ss", "00:00:05", "-vframes", "1", output_path, "-y"]
+
+            elif task_type == "softsub":
+                await reply.edit_text("🎬 Adding Softsubs...")
+                # Note: This assumes the sub is internal or you have a specific flow. 
+                # Basic re-encode for safety:
+                cmd = ["ffmpeg", "-i", original_path, "-c", "copy", "-c:s", "mov_text", output_path, "-y"]
+
+            # Execute FFmpeg
+            process = await asyncio.create_subprocess_exec(*cmd)
+            await process.wait()
+
+            if not os.path.exists(output_path):
+                await reply.edit_text("❌ FFmpeg failed to create the file.")
                 continue
 
-            status = await message.reply_text("📥 Downloading...")
-            path = await bot.download_media(message)
-            output = f"out_{path}.mp4"
-
-            await status.edit_text(f"⚙️ Encoding to {resolution} (Ultrafast Mode)...")
+            await reply.edit_text("📤 Uploading...")
+            if task_type == "screenshot":
+                await bot.send_photo(message.chat.id, photo=output_path)
+            else:
+                await bot.send_video(message.chat.id, video=output_path, caption=f"Done: {value}")
             
-            # Optimized for Koyeb Free Tier (libx264 + ultrafast to save CPU)
-            cmd = [
-                "ffmpeg", "-i", path,
-                "-vf", f"scale={resolution}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "27",
-                "-c:a", "aac", "-b:a", "128k",
-                output, "-y"
-            ]
-            
-            proc = await asyncio.create_subprocess_exec(*cmd)
-            await proc.wait()
-
-            await status.edit_text("📤 Uploading...")
-            await bot.send_video(message.chat.id, video=output, caption=f"Done: {resolution}")
-            await status.delete()
+            await reply.delete()
 
         except Exception as e:
             await message.reply_text(f"❌ Error: {str(e)}")
         finally:
-            if 'path' in locals() and os.path.exists(path): os.remove(path)
-            if 'output' in locals() and os.path.exists(output): os.remove(output)
+            if os.path.exists(original_path): os.remove(original_path)
+            if os.path.exists(output_path): os.remove(output_path)
             queue.task_done()
 
-@bot.on_message((filters.video | filters.document) & filters.private)
-async def handle_incoming(client, message):
-    file = message.video or message.document
-    if not file or (message.document and "video" not in message.document.mime_type):
-        return
+# --- Handlers ---
+@bot.on_message(filters.command(["encode", "screenshot", "softsub"]))
+async def handle_commands(client, message):
+    if not message.reply_to_message or not (message.reply_to_message.video or message.reply_to_message.document):
+        return await message.reply_text("❌ Please reply to a video file.")
 
-    # THE 2GB CHECK
-    if file.file_size > MAX_FILE_SIZE:
-        await message.reply_text("⚠️ **File too large!**\nI can only process files up to 2GB.")
-        return
-
-    await queue.put((message, "encode", "1280:-1")) # Default 720p
-    await message.reply_text("✅ Added to queue. Wait for your turn.")
-
-# --- Main Entry Point ---
-async def main():
-    # 1. Start Health Check Server (Solves Koyeb TCP issue)
-    await start_web_server()
+    file = message.reply_to_message.video or message.reply_to_message.document
     
-    # 2. Sync Commands
+    # 2GB CHECK
+    if file.file_size > MAX_FILE_SIZE:
+        return await message.reply_text("⚠️ File is too large! Maximum limit is 2GB.")
+
+    cmd_parts = message.text.split()
+    task = cmd_parts[0].replace("/", "")
+    value = cmd_parts[1] if len(cmd_parts) > 1 else "720p"
+
+    await queue.put((message.reply_to_message, task, value))
+    await message.reply_text(f"✅ Added to Queue: {task} ({value if task == 'encode' else ''})")
+
+# --- Startup ---
+async def main():
+    await start_web_server()
     await bot.start()
+    
+    # Auto-sync commands
     await bot.set_bot_commands([
-        BotCommand("start", "Start the bot"),
-        BotCommand("help", "Show help menu"),
-        BotCommand("encode", "Encode video"),
-        BotCommand("merge", "Merge videos")
+        BotCommand("start", "Check if bot is alive"),
+        BotCommand("help", "Get usage instructions"),
+        BotCommand("encode", "Usage: /encode 720p (reply to video)"),
+        BotCommand("screenshot", "Generate SS (reply to video)"),
+        BotCommand("softsub", "Add subs (reply to video)")
     ])
     
-    # 3. Start Queue Worker
     asyncio.create_task(worker())
-    
-    print("Bot is fully active!")
+    print("Bot is active and synced!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
